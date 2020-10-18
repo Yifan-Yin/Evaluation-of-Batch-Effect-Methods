@@ -1,0 +1,671 @@
+---
+title: "Batch Effect Correction_Chip"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 120),
+  message = FALSE,
+  warning = FALSE
+)
+```
+# load libraries
+```{r}
+library(devtools)
+library(dplyr)
+library(tidyr)
+library(Seurat)
+library(ggplot2)
+library(readxl)
+library(harmony)
+library(scran)
+library(SeuratWrappers)
+library(SeuratData)
+library(liger)
+library(kBET)
+library(FNN)
+library(lisi)
+library(magrittr)
+library(limma)
+library(WeightedCluster)
+library(cluster)
+library(mclust)
+library(batchelor)
+library(caret)
+library(ggpubr)
+library(AnnotationHub)
+library(SingleR)
+library(celldex)
+```
+
+# Load Data
+```{r init}
+# load library info
+lib.info <- read_xlsx('H:\\GSAT Rotation1\\data\\library_info_5_and_3.xlsx')
+# load data for individual samples and merge together
+data <- NULL
+for (i in 1:nrow(lib.info)) {
+i.df <- lib.info[i,]
+i.dir <- paste0(i.df$AnalysisDir)
+i.data <- Read10X(data.dir = i.dir)
+i.obj <- CreateSeuratObject(counts = i.data, project = i.df$StudyID)
+i.obj <- RenameCells(i.obj, add.cell.id = i.df$StudyID)
+if (is.null(data)) { data <- i.obj } else { data <- merge(data, i.obj)}
+}
+# Add annotation about chip (batch)
+data@meta.data <- cbind(
+data@meta.data, 
+lib.info[match(data$orig.ident, lib.info$StudyID), 
+c("StudyID", "Chip", "Type", 'Flowcell','Assay')])
+
+# check data
+data
+```
+Result:
+merged data:
+36601 features across 31358 samples within 1 assay 
+
+# Standard pre-processing workflow
+```{r mito, fig.height=7, fig.width=13}
+# add mt gene percent as a column
+data[["percent.mt"]] <- PercentageFeatureSet(object = data, pattern = "^MT-")
+```
+## Filter Cells
+keep cells which meet these requirements
+1. mt gene < 10% 
+2. nfeature <3000
+3. nfeature >300  
+3. ncounts < 13000
+```{r qc2, fig.height=7, fig.width=13}
+# visualize QC metrics as a violin plot
+VlnPlot(object = data, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, group.by = 'StudyID')
+
+# visualize the distribution of counts detected per cell via histogram
+data@meta.data %>% 
+  	ggplot(aes(color=orig.ident, x=nCount_RNA, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300)
+
+# visualize the distribution of genes detected per cell via histogram
+data@meta.data %>% 
+  	ggplot(aes(color=orig.ident, x=nFeature_RNA, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300)
+
+# visualize feature-feature relationships
+plot1 <- FeatureScatter(object = data, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by = 'StudyID') 
+plot2 <- FeatureScatter(object = data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = 'StudyID') 
+CombinePlots(plots = list(plot1,plot2))
+
+# visualize the relationship between nFeature and nCount via scatter plot
+data@meta.data %>% 
+  	ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mt)) + 
+  	geom_point() + 
+	  scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~orig.ident)
+
+# subset data 
+data <- subset(x = data, subset = nFeature_RNA > 300 & nFeature_RNA < 3000 & percent.mt < 10 & nCount_RNA <15000)
+data
+```
+result:
+In the raw dataset, we have 31358 cells.
+After filtering, we have 27719 cells (88% of the raw cells are kept).
+
+## Normalization
+```{r normalize}
+# data normalization
+data <- NormalizeData(object = data, normalization.method = "LogNormalize", scale.factor = 1e4)
+```
+## HVG
+```{r var_features, fig.height=5, fig.width=11}
+# find highly variable genes( n = 2000)
+data <- FindVariableFeatures(object = data,selection.method = 'vst', nfeatures = 2000)
+
+# check top 10 highly variable genes
+top10 <- head(x = VariableFeatures(object = data), 10)
+
+top10
+# plot variable features
+plot1 <- VariableFeaturePlot(object = data)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+plot2
+```
+
+# PCA
+## RunPCA
+```{r pca,results='hide'}
+# scaling data
+data <- ScaleData(data, vars.to.regress = "percent.mt")
+# run pca
+data <- RunPCA(object = data, features = VariableFeatures(object = data))
+```
+## PCA Visualization
+```{r multi-heatmap, fig.height=12, fig.width=9}
+DimPlot(object = data, reduction = 'pca', group.by = 'Chip')
+DimHeatmap(object = data, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+# Batch Effect Correction
+## Harmony
+Procedure: Merged 3' and 5' dataset, QC, normalization, find HVGs, scaling, PCA, RunHarmony(), clustering, runUMAP()
+The Vignette can be found at: https://htmlpreview.github.io/?https://github.com/satijalab/seurat.wrappers/blob/master/docs/harmony.html
+```{r tsneplot, fig.height=5, fig.width=13}
+# run harmony 
+data.harmony <- RunHarmony(data, group.by.vars = 'Chip', reduction = 'pca')
+
+# clustering
+data.harmony<-  data.harmony %>%   
+    FindNeighbors(reduction = "harmony", dims = 1:40) %>% 
+    FindClusters(resolution = 1.5) %>% 
+    RunUMAP(reduction = "harmony", dims = 1:40) 
+
+# visualize ump result
+harmony_plot <-DimPlot(data.harmony, reduction = "umap", label = TRUE, pt.size = .1, group.by = c('ident','Chip', 'StudyID'))
+harmony_plot
+```
+## FastMNN
+Procedure: Merged 3' and 5' dataset, QC, normalization, find HVGs, RunFastMNN(), clustering, runUMAP()
+The Vignette can be found at: https://htmlpreview.github.io/?https://github.com/satijalab/seurat.wrappers/blob/master/docs/fast_mnn.html
+```{r tsneplot, fig.height=5, fig.width=13}
+# create a new seurat object that is not being processed
+data1 <- NULL
+for (i in 1:nrow(lib.info)) {
+i.df <- lib.info[i,]
+i.dir <- paste0(i.df$AnalysisDir)
+i.data <- Read10X(data.dir = i.dir)
+i.obj <- CreateSeuratObject(counts = i.data, project = i.df$StudyID)
+i.obj <- RenameCells(i.obj, add.cell.id = i.df$StudyID)
+if (is.null(data1)) { data1 <- i.obj } else { data1 <- merge(data1, i.obj)}
+}
+# Add annotation about chip (batch)
+data1@meta.data <- cbind(
+data1@meta.data, 
+lib.info[match(data1$orig.ident, lib.info$StudyID), 
+c("StudyID", "Chip", "Type", 'Flowcell','Assay')])
+# add mt percent
+data1[["percent.mt"]] <- PercentageFeatureSet(object = data1, pattern = "^MT-")
+# subset data
+data1 <- subset(x = data1, subset = nFeature_RNA > 300 & nFeature_RNA < 3000 & percent.mt < 10 & nCount_RNA <15000)
+
+# normalization and find HVGs
+data.mnn<- NormalizeData(data1, normalization.method = "LogNormalize", scale.factor = 1e4) %>%
+           FindVariableFeatures(selection.method = 'vst', nfeatures = 5000)
+
+# run Fast MNN based on Chip type
+data.mnn <- RunFastMNN(object.list = SplitObject(data.mnn, split.by = 'Chip'))
+
+# run UMAP
+data.mnn <- data.mnn %>%
+   FindNeighbors(reduction = 'mnn', dims = 1:40) %>%
+   FindClusters(resolution = 1.5) %>%
+   RunUMAP(reduction = "mnn", dims = 1:40) 
+
+# visualize by individual samples
+mnn_plot <- DimPlot(data.mnn, reduction = "umap", label = TRUE, pt.size = .1, group.by = c('ident','Chip', 'StudyID'))
+mnn_plot
+```
+## Seurat
+Procedure: Individual dataset, QC, normalization, integration, scaling, pca,  clustering, runUMAP()
+The Vignette can be found at: https://satijalab.org/seurat/v3.2/integration.html
+```{r tsneplot, fig.height=5, fig.width=13}
+# separate merged data into individual datasets based on Chip type
+data.list <- SplitObject(data1, split.by = 'Chip')
+# perform data preprocessing for individual samples
+for (i in 1:length(x = data.list)) {
+    data.list[[i]] <- NormalizeData(object = data.list[[i]], verbose = FALSE)
+    data.list[[i]] <- FindVariableFeatures(object = data.list[[i]], 
+        selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+}
+# find anchors for performing CCA
+data.anchors <- FindIntegrationAnchors(object.list = data.list, dims = 1:40)
+# integrate datasets 
+data.seurat <- IntegrateData(anchorset = data.anchors, dims = 1:40) %>%
+               ScaleData(verbose = FALSE) %>%
+               RunPCA(npcs = 40, verbose = FALSE) %>%
+               FindNeighbors(reduction = "pca", dims = 1:40) %>%
+               FindClusters(resolution = 1.5) %>%
+               RunUMAP(reduction = "pca", dims = 1:40)
+# visualize the results
+seurat_plot <- DimPlot(data.seurat, reduction = "umap", label = TRUE, pt.size = .1, group.by = c('ident','Chip', 'StudyID'), ncol = 3)
+seurat_plot
+```
+##LIGER
+Procedure: Merged 3' and 5' dataset, QC, normalization, find HVGs, scaling, RunOptimizeALS(), RunQuantileNorm(), clustering, runUMAP()
+The Vignette can be found at: https://htmlpreview.github.io/?https://github.com/satijalab/seurat.wrappers/blob/master/docs/liger.html
+```{r tsneplot, fig.height=5, fig.width=13}
+# normalization, find HVGs, and scaling
+## data1 is already subset but not normalized
+data.liger <- NormalizeData(data1, normalization.method = "LogNormalize", scale.factor = 1e4) %>%
+              FindVariableFeatures(selection.method = 'vst', nfeatures = 2000) %>%
+              ScaleData(split.by = 'Chip', do.center = FALSE)
+
+data.liger <- RunOptimizeALS(data.liger, k = 20, lambda = 5, split.by = 'Chip') %>%
+              RunQuantileNorm(split.by = "Chip")
+
+data.liger <- FindNeighbors(data.liger, reduction = "iNMF", dims = 1:20) %>%
+              FindClusters(resolution = 1.5) %>%
+              RunUMAP(dims = 1:ncol(data.liger[["iNMF"]]), reduction = "iNMF")
+
+# visualize ump result
+liger_plot <- DimPlot(data.liger, reduction = "umap", label = TRUE, pt.size = .1, group.by = c('ident','Chip', 'StudyID'), ncol = 3)
+liger_plot
+```
+## Raw
+### Clustering
+```{r}
+data <- FindNeighbors(data, dims = 1: 40) %>%
+        FindClusters(resolution = 1.5) %>%
+        RunUMAP(dims = 1:40)
+```
+### Visualization
+```{r tsneplot, fig.height=5, fig.width=15}
+raw_plot <- DimPlot(data, reduction = 'umap', group.by = c('ident','Chip','StudyID'), label = T)
+raw_plot
+```
+
+# Evaluate Batch Effect
+## Extract corrected matrixs from Seurat Object
+```{r}
+matrix.raw <- data@reductions$pca@cell.embeddings
+matrix.harmony <- data.harmony@reductions$harmony@cell.embeddings
+matrix.mnn <- data.mnn@reductions$mnn@cell.embeddings
+matrix.seurat <- data.seurat@reductions$pca@cell.embeddings
+matrix.liger <-data.liger@reductions$iNMF@cell.embeddings
+```
+
+## kBET
+### Raw
+```{r}
+batch <- as.factor(data$Chip)
+# calculate k0 and knn
+k0 <- floor(mean(table(batch)))
+knn.raw <- get.knn(matrix.raw, k = k0, algorithm = 'cover_tree')
+# calculate kBet based on different testsize
+batch.estimate.raw_5 <- kBET(matrix.raw, batch = batch, k0=k0, knn = knn.raw, verbose = TRUE, testSize = 5)
+batch.estimate.raw_10 <- kBET(matrix.raw, batch = batch, k0=k0, knn = knn.raw, verbose = TRUE, testSize = 10)
+batch.estimate.raw_15 <- kBET(matrix.raw, batch = batch, k0=k0, knn = knn.raw, verbose = TRUE, testSize = 15)
+batch.estimate.raw_20 <- kBET(matrix.raw, batch = batch, k0=k0, knn = knn.raw, verbose = TRUE, testSize = 20)
+batch.estimate.raw_25 <- kBET(matrix.raw, batch = batch, k0=k0, knn = knn.raw, verbose = TRUE, testSize = 25)
+```
+### Harmony
+```{r}
+# calculate knn
+knn.harmony <- get.knn(matrix.harmony, k = k0, algorithm = 'cover_tree')
+# calculate kBet based on different testsize
+batch.estimate.harmony_5 <- kBET(matrix.harmony, batch = batch, k0=k0, knn = knn.harmony, verbose = TRUE, testSize = 5)
+batch.estimate.harmony_10 <- kBET(matrix.harmony, batch = batch, k0=k0, knn = knn.harmony, verbose = TRUE, testSize = 10)
+batch.estimate.harmony_15 <- kBET(matrix.harmony, batch = batch, k0=k0, knn = knn.harmony, verbose = TRUE,  testSize = 15)
+batch.estimate.harmony_20 <- kBET(matrix.harmony, batch = batch, k0=k0, knn = knn.harmony, verbose = TRUE,  testSize = 20)
+batch.estimate.harmony_25 <- kBET(matrix.harmony, batch = batch, k0=k0, knn = knn.harmony, verbose = TRUE,  testSize = 25)
+```
+### Fast MNN
+```{r}
+# calculate knn
+knn.mnn <- get.knn(matrix.harmony, k = k0, algorithm = 'cover_tree')
+# calculate kBet based on different testsize
+batch.estimate.mnn_5 <- kBET(matrix.mnn, batch = batch,k0=k0, knn = knn.mnn,verbose = TRUE, testSize = 5)
+batch.estimate.mnn_10 <- kBET(matrix.mnn, batch = batch, k0=k0, knn = knn.mnn, verbose = TRUE, do.pca = FALSE, testSize = 10)
+batch.estimate.mnn_15 <- kBET(matrix.mnn, batch = batch, k0=k0, knn = knn.mnn, verbose = TRUE,  testSize = 15)
+batch.estimate.mnn_20 <- kBET(matrix.mnn, batch = batch, k0=k0, knn = knn.mnn, verbose = TRUE,  testSize = 20)
+batch.estimate.mnn_25 <- kBET(matrix.mnn, batch = batch, k0=k0, knn = knn.mnn, verbose = TRUE,  testSize = 25)
+```
+### Seurat
+```{r}
+# calculate knn
+knn.seurat <- get.knn(matrix.seurat, k = k0, algorithm = 'cover_tree')
+# calculate kBet based on different testsize
+batch.estimate.seurat_5 <- kBET(matrix.seurat, batch = batch, k0=k0, knn = knn.seurat, verbose = TRUE, testSize = 5)
+batch.estimate.seurat_10 <- kBET(matrix.seurat, batch = batch, k0=k0, knn = knn.seurat,verbose = TRUE)
+batch.estimate.seurat_15 <- kBET(matrix.seurat, batch = batch, k0=k0, knn = knn.seurat,verbose = TRUE,  testSize = 15)
+batch.estimate.seurat_20 <- kBET(matrix.seurat, batch = batch, k0=k0, knn = knn.seurat,verbose = TRUE,  testSize = 20)
+batch.estimate.seurat_25 <- kBET(matrix.seurat, batch = batch, k0=k0, knn = knn.seurat,verbose = TRUE,  testSize = 25)
+```
+### LIGER
+```{r}
+# calculate knn
+knn.liger <- get.knn(matrix.liger, k = k0, algorithm = 'cover_tree')
+# calculate kBet based on different testsize
+batch.estimate.liger_5 <- kBET(matrix.liger, batch = batch, k0=k0, knn = knn.liger, verbose = TRUE, testSize = 5)
+batch.estimate.liger_10 <- kBET(matrix.liger, batch = batch, k0=k0, knn = knn.liger,verbose = TRUE)
+batch.estimate.liger_15 <- kBET(matrix.liger, batch = batch, k0=k0, knn = knn.liger,verbose = TRUE,  testSize = 15)
+batch.estimate.liger_20 <- kBET(matrix.liger, batch = batch, k0=k0, knn = knn.liger,verbose = TRUE,  testSize = 20)
+batch.estimate.liger_25 <- kBET(matrix.liger, batch = batch, k0=k0, knn = knn.liger,verbose = TRUE,  testSize = 25)
+```
+
+## LISI
+### Raw
+```{r}
+# calculate iLISI score for the uncorrected dataset
+ilisi_raw <- compute_lisi(matrix.raw, meta_data = data@meta.data, label_colnames = 'Chip')
+# calculate median value of iLISI score
+ilisi_raw_median <- median(ilisi_raw$Chip)
+
+# calculate cLISI score for the uncorrected dataset
+clisi_raw <- compute_lisi(matrix.raw, meta_data = data@meta.data, label_colnames = 'seurat_clusters') 
+# calculate median value of clisi score            
+clisi_raw_median <- median(clisi_raw$seurat_clusters)
+```
+
+### Harmony
+```{r}
+# calculate iLISI score
+ilisi_harmony <- compute_lisi(matrix.harmony, meta_data = data.harmony@meta.data, label_colnames = 'Chip')
+# calculate median value of iLISI score
+ilisi_harmony_median <- median(ilisi_harmony$Chip)
+
+# calculate cLISI score and normalize the data
+clisi_harmony <- compute_lisi(matrix.harmony, meta_data = data.harmony@meta.data, label_colnames = 'seurat_clusters') # calculate median value of clisi score  
+clisi_harmony_median <- median(clisi_harmony$seurat_clusters)
+```
+### Fast MNN
+```{r}
+# calculate iLISI score 
+ilisi_mnn <- compute_lisi(matrix.mnn, meta_data = data.mnn@meta.data, label_colnames = 'Chip')
+# calculate median value of iLISI score
+ilisi_mnn_median <- median(ilisi_mnn$Chip)
+
+# calculate cLISI score and normalize the data
+clisi_mnn <- compute_lisi(matrix.mnn, meta_data = data.mnn@meta.data, label_colnames = 'seurat_clusters') 
+# calculate median value of clisi score 
+clisi_mnn_median <- median(clisi_mnn$seurat_clusters)
+```
+### Seurat
+```{r}
+# calculate iLISI score
+ilisi_seurat <- compute_lisi(matrix.seurat, meta_data = data.seurat@meta.data, label_colnames = 'Chip')
+# calculate median value of iLISI score
+ilisi_seurat_median <- median(ilisi_seurat$Chip)
+
+# calculate cLISI score 
+clisi_seurat <- compute_lisi(matrix.seurat, meta_data = data.seurat@meta.data, label_colnames = 'seurat_clusters') 
+# calculate median value of clisi score
+clisi_seurat_median <- median(clisi_seurat$seurat_clusters)
+```
+### LIGER
+```{r}
+# calculate iLISI score
+ilisi_liger <- compute_lisi(matrix.liger, meta_data = data.liger@meta.data, label_colnames = 'Chip')
+# calculate median value of iLISI score
+ilisi_liger_median <- median(ilisi_liger$Chip)
+
+# calculate cLISI score and normalize the data
+clisi_liger <- compute_lisi(matrix.liger, meta_data = data.liger@meta.data, label_colnames = 'seurat_clusters') 
+# calculate cLISI score 
+clisi_liger_median <- median(clisi_liger$seurat_clusters)
+```
+
+## ASW
+### Raw
+```{r}
+# calculate euclidean distance in the matrix
+matrix.raw_dist <- dist(matrix.raw)
+
+# calculate asw score for batch effects 
+asw_raw_batch <- wcSilhouetteObs(matrix.raw_dist, clustering = data$Chip, measure = 'ASW')
+asw_raw_batch_median <- median(asw_raw_batch)
+
+# calculate asw score for cell purity
+asw_raw_cell <- wcSilhouetteObs(matrix.raw_dist, clustering = data$seurat_clusters, measure = 'ASW')  
+asw_raw_cell_median <- median(asw_raw_cell)
+```
+### Harmony
+```{r}
+# calculate euclidean distance in the matrix
+matrix.harmony_dist <- dist(matrix.harmony)
+
+# calculate asw score for batch effects 
+asw_harmony_batch <- wcSilhouetteObs(matrix.harmony_dist, clustering = data.harmony$Chip, measure = 'ASW')
+asw_harmony_batch_median <- median(asw_harmony_batch)
+
+# calculate asw score for cell purity
+asw_harmony_cell <- wcSilhouetteObs(matrix.harmony_dist, clustering = data.harmony$seurat_clusters, measure = 'ASW')
+asw_harmony_cell_median <- median(asw_harmony_cell)
+```
+### Fast MNN
+```{r}
+# calculate euclidean distance in the matrix
+matrix.mnn_dist <- dist(matrix.mnn)
+
+# calculate asw score for batch effects 
+asw_mnn_batch <- wcSilhouetteObs(matrix.mnn_dist, clustering = data.mnn$Chip, measure = 'ASW')
+asw_mnn_batch_median <- median(asw_mnn_batch)
+
+# calculate asw score for cell purity
+asw_mnn_cell <- wcSilhouetteObs(matrix.mnn_dist, clustering = data.mnn$seurat_clusters, measure = 'ASW') 
+asw_mnn_cell_median <- median(asw_mnn_cell)
+```
+### Seurat
+```{r}
+# calculate euclidean distance in the matrix
+matrix.seurat_dist <- dist(matrix.seurat)
+
+# calculate asw score for batch effects
+asw_seurat_batch <- wcSilhouetteObs(matrix.seurat_dist, clustering = data.seurat$Chip, measure = 'ASW')
+asw_seurat_batch_median <- median(asw_seurat_batch)
+
+# calculate asw score for cell purity
+asw_seurat_cell <- wcSilhouetteObs(matrix.seurat_dist, clustering = data.seurat$seurat_clusters, measure = 'ASW') 
+asw_seurat_cell_median <- median(asw_seurat_cell)
+```
+### LIGER
+```{r}
+# calculate euclidean distance in the matrix
+matrix.liger_dist <- dist(matrix.liger)
+
+# calculate asw score for batch effects
+asw_liger_batch <- wcSilhouetteObs(matrix.liger_dist, clustering = data.liger$Chip, measure = 'ASW')
+asw_liger_batch_median <- median(asw_liger_batch)
+
+# calculate asw score for cell purity
+asw_liger_cell <- wcSilhouetteObs(matrix.liger_dist, clustering = data.liger$seurat_clusters, measure = 'ASW') 
+asw_liger_cell_median <- median(asw_liger_cell)
+```
+
+## ARI
+### Raw
+```{r}
+# calculate kmeans
+k.raw_cell <- kmeans(matrix.raw, centers = length(levels(data$seurat_clusters)))
+# calculate ari score for cell type purity
+ari_raw_cell <- adjustedRandIndex(as.numeric(data$seurat_clusters), as.numeric(k.raw_cell$cluster))
+
+# calculate kmeans
+k.raw_batch <- kmeans(matrix.raw, centers = 3)
+cluster_batch <- data@meta.data %>%
+     mutate(cluster = case_when(Chip == "CHIP013" ~ 3,
+                                Chip == "CHIPCCC" ~ 1,
+                                Chip == "CHIPDDD" ~ 2))
+# calculate ari score for batch
+ari_raw_batch <- adjustedRandIndex(as.numeric(cluster_batch$cluster), as.numeric(k.raw_cell$cluster))
+
+```
+### Harmony
+```{r}
+# calculate kmeans
+k.harmony_cell <- kmeans(matrix.harmony, centers = length(levels(data.harmony$seurat_clusters)))
+# calculate ari score for cell type purity
+ari_harmony_cell <- adjustedRandIndex(as.numeric(data.harmony$seurat_clusters), as.numeric(k.harmony_cell$cluster))
+
+# calculate kmeans
+k.harmony_batch <- kmeans(matrix.harmony, centers = 3)
+# calculate ari score for batch
+ari_harmony_batch <- adjustedRandIndex(as.numeric(cluster_batch$cluster), as.numeric(k.harmony_cell$cluster))
+
+```
+### Fast MNN
+```{r}
+# calculate kmeans
+k.mnn_cell <- kmeans(matrix.mnn, centers = length(levels(data.mnn$seurat_clusters)))
+# calculate ari score for cell type purity
+ari_mnn_cell <- adjustedRandIndex(as.numeric(data.mnn$seurat_clusters), as.numeric(k.mnn_cell$cluster))
+
+# calculate kmeans
+k.mnn_batch <- kmeans(matrix.mnn, centers = 3)
+# calculate ari score for cell type purity
+ari_mnn_batch <- adjustedRandIndex(as.numeric(cluster_batch$cluster), as.numeric(k.mnn_cell$cluster))
+```
+### Seurat
+```{r}
+# calculate kmeans
+k.seurat_cell <- kmeans(matrix.seurat, centers = length(levels(data.seurat$seurat_clusters)))
+# calculate ari score for cell type purity
+ari_seurat_cell <- adjustedRandIndex(as.numeric(data.seurat$seurat_clusters), as.numeric(k.seurat_cell$cluster))
+
+# calculate kmeans
+k.seurat_batch <- kmeans(matrix.seurat, centers = 3)
+# calculate ari score for cell type purity
+ari_seurat_batch <- adjustedRandIndex(as.numeric(cluster_batch$cluster), as.numeric(k.seurat_cell$cluster))
+```
+### LIGER
+```{r}
+# calculate kmeans
+k.liger_cell <- kmeans(matrix.liger, centers = length(levels(data.liger$seurat_clusters)))
+# calculate ari score for cell type purity
+ari_liger_cell <- adjustedRandIndex(as.numeric(data.liger$seurat_clusters), as.numeric(k.liger_cell$cluster))
+
+# calculate kmeans
+k.liger_batch <- kmeans(matrix.liger, centers = 3)
+# calculate ari score for cell type purity
+ari_liger_batch <- adjustedRandIndex(as.numeric(cluster_batch$cluster), as.numeric(k.liger_cell$cluster))
+```
+
+# Save result into a datatable
+## LISI
+```{r}
+# store LISI results into a datatable
+lisi_mnn_result <- c(ilisi_mnn_median, clisi_mnn_median) 
+lisi_harmony_result <- c(ilisi_harmony_median, clisi_harmony_median)
+lisi_seurat_result <- c(ilisi_seurat_median, clisi_seurat_median)
+lisi_liger_result <- c(ilisi_liger_median, clisi_liger_median)
+lisi_raw_result <- c(ilisi_raw_median, clisi_raw_median) 
+lisi_result <- rbind(lisi_raw_result, lisi_harmony_result, lisi_mnn_result, lisi_seurat_result, lisi_liger_result)
+colnames(lisi_result) <- c('iLISI_median','cLISI_median')
+lisi_result <- lisi_result %>%
+               as_tibble() %>%
+               mutate(reverse_cLISI = 1 - cLISI_median,
+                      iLISI_norm = (iLISI_median - min(iLISI_median)) / (max(iLISI_median) - min(iLISI_median)),
+                      cLISI_norm = (cLISI_median - min(cLISI_median)) / (max(cLISI_median) - min(cLISI_median)),
+                      fscore = 2 * (1 - cLISI_norm) * iLISI_norm / (1 - cLISI_norm + iLISI_norm))
+rownames(lisi_result) <- c('Raw','Harmony','FastMNN','Seurat','LIGER')
+```
+## ASW
+```{r}
+# store ASW results into a datatable
+asw_mnn_result <- c(asw_mnn_batch_median, asw_mnn_cell_median) 
+asw_harmony_result <- c(asw_harmony_batch_median, asw_harmony_cell_median)
+asw_seurat_result <- c(asw_seurat_batch_median, asw_seurat_cell_median)
+asw_liger_result <- c(asw_liger_batch_median, asw_liger_cell_median)
+asw_raw_result <- c(asw_raw_batch_median, asw_raw_cell_median) 
+asw_result <- rbind(asw_raw_result, asw_harmony_result, asw_mnn_result, asw_seurat_result, asw_liger_result)
+colnames(asw_result) <- c('ASW_batch_median','ASW_cell_median')
+
+asw_result <- asw_result %>%
+              as_tibble() %>%
+              mutate(ASW_batch_norm = (ASW_batch_median - min(ASW_batch_median)) / (max(ASW_batch_median) - min(ASW_batch_median)),
+                     ASW_cell_norm = (ASW_cell_median - min(ASW_cell_median)) / (max(ASW_cell_median) - min(ASW_cell_median)),
+                     fscore = (2 * (1 - ASW_batch_norm) *ASW_cell_norm) / (1- ASW_batch_norm + ASW_cell_norm),
+                     reverse_batch_median = 1 - ASW_batch_median)
+rownames(asw_result) <- c('Raw','Harmony','FastMNN','Seurat','LIGER')
+
+```
+## ARI
+```{r}
+# store ARI result into a datatable
+ari_mnn_result <- c(ari_mnn_batch, ari_mnn_cell) 
+ari_harmony_result <- c(ari_harmony_batch, ari_harmony_cell)
+ari_seurat_result <- c(ari_seurat_batch, ari_seurat_cell)
+ari_liger_result <- c(ari_liger_batch, ari_liger_cell)
+ari_raw_result <- c(ari_raw_batch, ari_raw_cell) 
+ari_result <- rbind(ari_raw_result, ari_harmony_result, ari_mnn_result, ari_seurat_result, ari_liger_result)
+colnames(ari_result) <- c('ARI_batch_median','ARI_cell_median')
+ari_result <- ari_result %>%
+              as_tibble() %>%
+              mutate(ARI_batch_norm = (ARI_batch_median - min(ARI_batch_median)) / (max(ARI_batch_median) - min(ARI_batch_median)),
+                     ARI_cell_norm = (ARI_cell_median - min(ARI_cell_median)) / (max(ARI_cell_median) - min(ARI_cell_median)),
+                     fscore = (2 * (1 - ARI_batch_norm) *ARI_cell_norm) / (1- ARI_batch_norm + ARI_cell_norm),
+                     reverse_ari_batch = 1 - ARI_batch_median)
+rownames(ari_result) <- c('Raw','Harmony','FastMNN','Seurat','LIGER')
+```
+
+## Visualize result
+```{r}
+LISI_plot <-lisi_result %>%
+            ggplot(aes(x = reverse_cLISI, y = iLISI_median, label = rownames(lisi_result))) +
+            geom_point(aes(colour = rownames(lisi_result))) +
+            geom_text(aes(colour = rownames(lisi_result)), hjust = 0, nudge_x = -0.01) +
+            xlab('1 - cLISI cell type') +
+            ylab('iLISI batch') +
+            labs(color = 'Methods')+
+            theme(axis.line = element_line(colour = "black"),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  panel.border = element_blank(),
+                  panel.background = element_blank()) 
+LISI_plot
+
+ASW_plot <- asw_result %>%
+            ggplot(aes(x = ASW_cell_median, y = reverse_batch_median, label = rownames(asw_result))) +
+            geom_point(aes(colour = rownames(asw_result))) +
+            geom_text(aes(colour = rownames(asw_result)), hjust = 0, nudge_x = -0.0045) +
+            xlab('ASW cell type') +
+            ylab('1 -ASW batch') +
+            labs(color = 'Methods') +
+            theme(axis.line = element_line(colour = "black"),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  panel.border = element_blank(),
+                  panel.background = element_blank()) 
+ASW_plot
+
+ARI_plot <- ari_result %>%
+            ggplot(aes(x = ARI_cell_median, y = reverse_ari_batch, label = rownames(ari_result))) +
+            geom_point(aes(colour = rownames(ari_result))) +
+            geom_text(aes(colour = rownames(ari_result)), hjust = 0, nudge_x = -0.015) +
+            xlab('ARI cell type') +
+            ylab('1 -ARI batch') +
+            labs(color = 'Methods') +
+            theme(axis.line = element_line(colour = "black"),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  panel.border = element_blank(),
+                  panel.background = element_blank()) 
+ARI_plot
+
+evaluation_plot <- ggarrange(LISI_plot, ASW_plot, ARI_plot, common.legend = T, legend = 'right')
+evaluation_plot
+```
+
+# Assign Cell Types
+```{r}
+# get reference data
+ref_data <- HumanPrimaryCellAtlasData()
+# pull matrix from Seurat Object
+singler_data <- as.SingleCellExperiment(data)
+# Get cell type information
+cell <- SingleR(singler_data, ref_data, labels = ref_data$label.main)
+# Store cell type information into Seurat Object
+data[['SingleR.cluster.labels']] <- cell$labels
+data.harmony[['SingleR.cluster.labels']] <- cell$labels
+data.mnn[['SingleR.cluster.labels']] <- cell$labels
+data.seurat[['SingleR.cluster.labels']] <- cell$labels
+data.liger[['SingleR.cluster.labels']] <- cell$labels
+```
